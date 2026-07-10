@@ -1,0 +1,53 @@
+[project]
+name = "ptouch-bt"
+version = "0.1.0"
+description = "Print labels on Brother P-Touch Bluetooth label printers (PT-E560BT, PT-E550W, PT-P710BT, PT-P300BT, ...) from macOS and Linux"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "zakx", email = "sg@unkreativ.org" }]
+keywords = [
+    "brother",
+    "p-touch",
+    "ptouch",
+    "label",
+    "printer",
+    "bluetooth",
+    "rfcomm",
+    "pt-e560bt",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Printing",
+]
+dependencies = [
+    "pillow>=10.0",
+    "pyserial>=3.5",
+    # Primary transport on macOS: direct RFCOMM to the SDP-advertised SPP
+    # channel (the auto-created /dev/cu.* node can bind the wrong channel).
+    "pyobjc-framework-IOBluetooth>=10.0; sys_platform == 'darwin'",
+]
+
+[project.scripts]
+ptouch-bt = "ptouch_bt.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ptouch_bt"]

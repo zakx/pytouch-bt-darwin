@@ -1,0 +1,10 @@
+# local research material & debug scripts (not for publication;
+# contains third-party code under other licenses)
+/reference/
+
+.venv/
+__pycache__/
+*.pyc
+dist/
+*.egg-info/
+.pytest_cache/

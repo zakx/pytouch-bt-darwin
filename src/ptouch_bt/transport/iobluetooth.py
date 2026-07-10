@@ -73,7 +73,8 @@ if HAVE_IOBLUETOOTH:
             self.buf += bytes(data)
 
         def rfcommChannelOpenComplete_status_(self, channel, status):
-            # Async open signals its result here; used to bound the wait.
+            # Required for openRFCOMMChannelSync to complete reliably; also
+            # records the status for debug logging.
             self.open_status = int(status)
 
         def rfcommChannelClosed_(self, channel):
@@ -100,6 +101,15 @@ class IOBluetoothTransport(Transport):
 
     SPP_UUID16 = 0x1101
 
+    # Opening the SPP channel (usually 2) on a freshly-paged link fails: the
+    # printer only accepts a data-channel DLCI once the RFCOMM multiplexer
+    # exists, and a direct SPP open on a cold mux stalls (the async open's
+    # completion callback never fires; the sync open returns kIOReturnError
+    # after its ~3s internal timeout).  Opening the always-available Apple
+    # iAP channel first establishes the mux, after which the SPP channel
+    # opens immediately.  See _prime_mux.
+    PRIME_CHANNEL = 1
+
     def __init__(
         self,
         address_or_name: str,
@@ -108,7 +118,6 @@ class IOBluetoothTransport(Transport):
         device=None,
         delegate_factory=None,
         pump=None,
-        open_timeout: float = 12.0,
     ) -> None:
         if device is None:
             if not HAVE_IOBLUETOOTH:
@@ -123,7 +132,6 @@ class IOBluetoothTransport(Transport):
         self._delegate_factory = (
             delegate_factory if delegate_factory is not None else _make_delegate
         )
-        self._open_timeout = open_timeout
         self._delegate = None
         self._channel = None
 
@@ -213,55 +221,51 @@ class IOBluetoothTransport(Transport):
         return 1
 
     def _try_open_channel(self, channel_id: int, attempts: int = 2):
-        """Open *channel_id* asynchronously, waiting at most *open_timeout*
-        for completion.  Returns the open channel, or ``None`` on failure
-        (so the caller can decide whether to reset and retry)."""
+        """Open *channel_id* synchronously (the open is self-bounded — it
+        returns, success or error, within a few seconds).  Primes the RFCOMM
+        multiplexer first so the SPP channel actually opens.  Returns the open
+        channel, or ``None`` on failure (so the caller can decide whether to
+        reset and retry)."""
         for attempt in range(1, attempts + 1):
+            self._prime_mux(channel_id)
             delegate = self._delegate_factory()
-            status, channel = self._device.openRFCOMMChannelAsync_withChannelID_delegate_(
+            status, channel = self._device.openRFCOMMChannelSync_withChannelID_delegate_(
                 None, channel_id, delegate
             )
-            if status != 0:
-                log.debug(
-                    "RFCOMM open channel %d attempt %d rejected immediately "
-                    "(IOReturn %s)",
-                    channel_id,
-                    attempt,
-                    _ioreturn(status),
-                )
-                self._pump(1.0)
-                continue
+            if status == 0 and channel is not None:
+                self._delegate = delegate
+                return channel
 
-            deadline = time.monotonic() + self._open_timeout
-            while delegate.open_status is None and time.monotonic() < deadline:
-                self._pump(0.1)
-
-            if delegate.open_status is None:
-                log.warning(
-                    "RFCOMM open channel %d attempt %d timed out after %.1fs",
-                    channel_id,
-                    attempt,
-                    self._open_timeout,
-                )
-                self._safe_close_channel(channel)
-                continue
-            if delegate.open_status != 0:
-                log.debug(
-                    "RFCOMM open channel %d attempt %d failed "
-                    "(openComplete %s)",
-                    channel_id,
-                    attempt,
-                    _ioreturn(delegate.open_status),
-                )
-                self._safe_close_channel(channel)
-                self._pump(1.0)
-                continue
-            if channel is None:  # pragma: no cover - defensive
-                continue
-
-            self._delegate = delegate
-            return channel
+            log.debug(
+                "RFCOMM open channel %d attempt %d failed (IOReturn %s)",
+                channel_id,
+                attempt,
+                _ioreturn(status),
+            )
+            self._safe_close_channel(channel)
+            self._pump(1.0)
         return None
+
+    def _prime_mux(self, channel_id: int) -> None:
+        """Establish the RFCOMM multiplexer by opening (and closing) the Apple
+        iAP channel, so the subsequent SPP channel open succeeds.  A no-op
+        when the target already is the prime channel."""
+        if channel_id == self.PRIME_CHANNEL:
+            return
+        delegate = self._delegate_factory()
+        status, channel = self._device.openRFCOMMChannelSync_withChannelID_delegate_(
+            None, self.PRIME_CHANNEL, delegate
+        )
+        if status == 0 and channel is not None:
+            log.debug("Primed RFCOMM mux via channel %d", self.PRIME_CHANNEL)
+        else:
+            log.debug(
+                "Priming channel %d open returned IOReturn %s",
+                self.PRIME_CHANNEL,
+                _ioreturn(status),
+            )
+        self._safe_close_channel(channel)
+        self._pump(0.3)
 
     @staticmethod
     def _safe_close_channel(channel) -> None:

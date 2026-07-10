@@ -40,17 +40,21 @@ class FakeChannel:
 class FakeDevice:
     """Scriptable IOBluetoothDevice stand-in.
 
-    *open_script* is a list of outcomes consumed one per channel-open
-    attempt: ``"ok"``, ``"reject"`` (immediate non-zero IOReturn),
-    ``"fail"`` (openComplete reports an error) or ``"timeout"``
-    (openComplete never fires).
+    *open_script* is a list of outcomes consumed one per SPP channel-open
+    attempt: ``"ok"`` (sync open succeeds) or ``"fail"`` (sync open returns
+    a non-zero IOReturn — the printer's cold-mux / stale-link failure).
+
+    Opening the prime channel (1) always succeeds — that mirrors the real
+    device, where the iAP channel opens to establish the RFCOMM mux.
     """
+
+    PRIME_CHANNEL = 1
 
     def __init__(self, open_script, connected=True):
         self._open_script = list(open_script)
         self._connected = connected
         self.calls: list[str] = []
-        self.channels: list[FakeChannel] = []
+        self.channels: list[FakeChannel] = []  # SPP (target) channels only
 
     def name(self):
         return "PT-E560BT_0334"
@@ -68,23 +72,22 @@ class FakeDevice:
         self._connected = False
         return 0
 
-    def openRFCOMMChannelAsync_withChannelID_delegate_(self, out, channel_id, delegate):
+    def openRFCOMMChannelSync_withChannelID_delegate_(self, out, channel_id, delegate):
+        if channel_id == self.PRIME_CHANNEL:
+            self.calls.append("prime")
+            return (0, FakeChannel())
         outcome = self._open_script.pop(0) if self._open_script else "fail"
         self.calls.append(f"open:{outcome}")
-        if outcome == "reject":
-            return (0xE00002E8, None)
         channel = FakeChannel()
         self.channels.append(channel)
         if outcome == "ok":
-            delegate.open_status = 0
-        elif outcome == "fail":
-            delegate.open_status = 0xE00002D8
-        elif outcome == "timeout":
-            delegate.open_status = None  # never completes
-        return (0, channel)
+            return (0, channel)
+        # "fail": real IOBluetooth returns the channel object with an error
+        # status (kIOReturnError) rather than None.
+        return (0xE00002BC, channel)
 
 
-def make_transport(open_script, *, connected=True, open_timeout=0.02):
+def make_transport(open_script, *, connected=True):
     device = FakeDevice(open_script, connected=connected)
     transport = IOBluetoothTransport(
         "PT-E560BT_0334",
@@ -92,7 +95,6 @@ def make_transport(open_script, *, connected=True, open_timeout=0.02):
         device=device,
         delegate_factory=FakeDelegate,
         pump=lambda _seconds: None,
-        open_timeout=open_timeout,
     )
     return transport, device
 
@@ -101,7 +103,8 @@ def test_connect_happy_path():
     transport, device = make_transport(["ok"])
     assert transport.channel_id == 2
     assert transport.name == "PT-E560BT_0334"
-    assert device.calls == ["open:ok"]  # already connected, no paging needed
+    # already connected, no paging needed; the mux is primed before the open
+    assert device.calls == ["prime", "open:ok"]
 
 
 def test_connect_pages_baseband_when_disconnected():
@@ -110,21 +113,38 @@ def test_connect_pages_baseband_when_disconnected():
     assert device.calls.index("openConnection") < device.calls.index("open:ok")
 
 
+def test_connect_primes_mux_before_spp_open():
+    _, device = make_transport(["ok"])
+    # the iAP channel is opened (to establish the RFCOMM mux) right before
+    # the SPP channel open
+    assert device.calls.index("prime") < device.calls.index("open:ok")
+
+
 def test_stale_link_recovers_via_baseband_reset():
     # Both first-pass attempts fail on the (stale) existing link; a reset
     # then lets the channel open.  This is the printer power-cycle case.
     transport, device = make_transport(["fail", "fail", "ok"])
     assert transport.channel_id == 2
     assert "closeConnection" in device.calls  # baseband was reset
-    # reset re-pages the device before the successful open
-    assert device.calls == ["open:fail", "open:fail", "closeConnection", "openConnection", "open:ok"]
+    # reset re-pages the device before the successful open (each SPP open is
+    # preceded by a mux prime)
+    assert device.calls == [
+        "prime",
+        "open:fail",
+        "prime",
+        "open:fail",
+        "closeConnection",
+        "openConnection",
+        "prime",
+        "open:ok",
+    ]
 
 
-def test_open_timeout_triggers_reset_and_recovers():
-    transport, device = make_transport(["timeout", "timeout", "ok"])
+def test_failed_opens_close_their_channels():
+    # A failed sync open still hands back a channel object; it must be closed
+    # so the attempts don't leak channels.
+    transport, device = make_transport(["fail", "fail", "ok"])
     assert transport.channel_id == 2
-    assert device.calls.count("closeConnection") == 1
-    # the timed-out channels get closed so they don't leak
     assert device.channels[0].closed
     assert device.channels[1].closed
 

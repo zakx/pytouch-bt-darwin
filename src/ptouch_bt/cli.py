@@ -29,7 +29,14 @@ def main(argv: list[str] | None = None) -> int:
 
     p_print = sub.add_parser("print", help="print an image or text")
     source = p_print.add_mutually_exclusive_group(required=True)
-    source.add_argument("-i", "--image", help="image file to print")
+    source.add_argument(
+        "-i",
+        "--image",
+        action="append",
+        metavar="FILE",
+        help="image file to print; repeat -i to print several different "
+        "labels as one half-cut strip",
+    )
     source.add_argument("-t", "--text", help="text to print (\\n for multi-line)")
     p_print.add_argument("--font", help="path to a .ttf/.ttc font (text mode)")
     p_print.add_argument("--copies", type=int, default=1)
@@ -44,6 +51,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_print.add_argument(
         "--half-cut", action="store_true", help="half-cut (if supported)"
+    )
+    p_print.add_argument(
+        "--no-half-cut",
+        action="store_true",
+        help="with several -i: full-cut between labels instead of half-cut",
     )
     p_print.add_argument(
         "--chain",
@@ -113,9 +125,19 @@ def main(argv: list[str] | None = None) -> int:
             if args.text is not None:
                 text = args.text.replace("\\n", "\n")
                 status = printer.print_text(text, font_path=args.font, **kwargs)
+            elif len(args.image) > 1:
+                status = printer.print_images(
+                    args.image,
+                    copies=args.copies,
+                    dither=not args.no_dither,
+                    end_margin_dots=args.margin,
+                    half_cut=not args.no_half_cut,
+                    compress=args.compress,
+                    dry_run=args.dry_run,
+                )
             else:
                 status = printer.print_image(
-                    args.image, dither=not args.no_dither, **kwargs
+                    args.image[0], dither=not args.no_dither, **kwargs
                 )
             print("Printed." if not args.dry_run else "Dry run complete.")
             if args.verbose:

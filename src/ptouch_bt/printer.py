@@ -183,6 +183,56 @@ class PTouchPrinter:
             dry_run=dry_run,
         )
 
+    def print_images(
+        self,
+        images: Iterable[Image.Image | str],
+        *,
+        copies: int = 1,
+        dither: bool = True,
+        end_margin_dots: int | None = None,
+        half_cut: bool = True,
+        high_resolution: bool = False,
+        compress: bool | None = None,
+        dry_run: bool = False,
+    ) -> PrinterStatus:
+        """Print several *different* labels as one job — a single tape strip
+        with a cut between each label and a full cut (eject) at the very end.
+
+        This is what Brother's own apps do: on models with a half cutter the
+        between-label cuts are *half* cuts, so the strip stays in one piece
+        until you tear the labels apart. On models with only a full cutter the
+        labels are separated with full cuts instead; on models with no cutter
+        at all they come out as one continuous strip (a warning is logged).
+
+        Each image is scaled so its height fills the loaded tape's printable
+        width, exactly like :meth:`print_image`. *copies* repeats the whole
+        strip. Returns the final printer status.
+        """
+        images = list(images)
+        if not images:
+            raise ValueError("print_images() needs at least one image")
+        status = self.get_status()
+        if not status.is_ready:
+            raise PrinterNotReady(status)
+        if status.tape_width_mm == 0:
+            raise PTouchError("no tape cassette loaded")
+
+        tape = self.profile.tape(status.tape_width_mm)
+        rasters = [
+            rasterize.image_to_raster(image, self.profile, tape, dither=dither)
+            for image in images
+        ]
+        return self.print_rasters(
+            rasters,
+            status=status,
+            copies=copies,
+            end_margin_dots=end_margin_dots,
+            half_cut=half_cut,
+            high_resolution=high_resolution,
+            compress=compress,
+            dry_run=dry_run,
+        )
+
     def print_text(self, text: str, *, font_path: str | None = None, **kwargs) -> PrinterStatus:
         """Render *text* with a system font and print it."""
         status = self.get_status()
@@ -212,8 +262,6 @@ class PTouchPrinter:
         model (PackBits on classic models, raw on the 2020+ EDGE/D-series).
         """
         profile = self.profile
-        bytes_per_line = profile.bytes_per_line
-        raster_lines = len(raster) // bytes_per_line
 
         if status is None:
             status = self.get_status()
@@ -225,12 +273,7 @@ class PTouchPrinter:
         if end_margin_dots is None:
             end_margin_dots = profile.min_feed_dots
 
-        # Pad very short labels up to the model's minimum length.
-        if raster_lines < profile.min_raster_lines:
-            raster = raster + b"\x00" * (
-                (profile.min_raster_lines - raster_lines) * bytes_per_line
-            )
-            raster_lines = profile.min_raster_lines
+        raster, raster_lines = self._prepare_raster(raster)
 
         self._reset()
         for copy in range(copies):
@@ -267,6 +310,119 @@ class PTouchPrinter:
             log.info("printing copy %d/%d ...", copy + 1, copies)
             status = self._wait_for_completion()
         return status
+
+    def print_rasters(
+        self,
+        rasters: list[bytes],
+        *,
+        status: PrinterStatus | None = None,
+        copies: int = 1,
+        end_margin_dots: int | None = None,
+        half_cut: bool = True,
+        high_resolution: bool = False,
+        compress: bool | None = None,
+        dry_run: bool = False,
+    ) -> PrinterStatus:
+        """Send several pre-encoded rasters as one multi-page strip.
+
+        The strip-and-cut behaviour is described on :meth:`print_images`;
+        this is the lower-level entry point when you already have raster
+        bytes. *copies* repeats the whole strip.
+        """
+        if not rasters:
+            raise ValueError("print_rasters() needs at least one raster")
+        profile = self.profile
+
+        if status is None:
+            status = self.get_status()
+            if not status.is_ready:
+                raise PrinterNotReady(status)
+
+        if compress is None:
+            compress = profile.supports_packbits
+        if end_margin_dots is None:
+            end_margin_dots = profile.min_feed_dots
+
+        # Capability handling. Half cuts need a half cutter; separating labels
+        # at all needs *some* cutter. Degrade loudly rather than silently
+        # doing the wrong thing (see devices.py for the per-model flags).
+        can_cut = profile.supports_auto_cut
+        if half_cut and not profile.supports_half_cut:
+            if can_cut:
+                log.warning(
+                    "%s has no half cutter; separating labels with full cuts",
+                    profile.name,
+                )
+            else:
+                log.warning(
+                    "%s cannot cut; labels print as one continuous strip",
+                    profile.name,
+                )
+            half_cut = False
+
+        pages = [self._prepare_raster(r) for r in rasters] * copies
+
+        self._reset()
+        status_out = status
+        for index, (raster, raster_lines) in enumerate(pages):
+            last_page = index == len(pages) - 1
+            if profile.d460bt_mode:
+                # This generation ends every page with 0x1A and uses the
+                # leading ESC i K packet to decide the cut: half-cut bit on the
+                # inner pages, nothing on the final page (so its 0x1A feeds and
+                # fully cuts). Engage the cutter on the inner pages so the
+                # requested cut actually happens.
+                self._send_page_d460bt(
+                    raster, raster_lines, status,
+                    end_margin_dots=end_margin_dots,
+                    auto_cut=can_cut and not last_page,
+                    chain=False,
+                    half_cut=half_cut and not last_page,
+                    compress=compress,
+                )
+            else:
+                # Classic generation: the half-cut bit rides in the ESC i K
+                # bitmask and the page separator is FF (more pages follow) vs
+                # SUB (last page, eject + full cut). Keep chain printing ON for
+                # a half-cut strip so the inner FFs don't force a full feed;
+                # for full-cut separation turn chaining OFF so each page cuts.
+                self._send_page_classic(
+                    raster, raster_lines, status,
+                    end_margin_dots=end_margin_dots,
+                    auto_cut=can_cut,
+                    half_cut=half_cut,
+                    high_resolution=high_resolution,
+                    chain=half_cut,
+                    compress=compress,
+                    follow_up=index > 0,
+                )
+
+            if dry_run:
+                log.info("dry run: skipping print commands")
+                self._reset()
+                return status
+
+            if profile.d460bt_mode or last_page:
+                self._send(protocol.print_and_feed())
+            else:
+                self._send(protocol.print_page())
+            log.info("printing label %d/%d ...", index + 1, len(pages))
+            status_out = self._wait_for_completion()
+        return status_out
+
+    def _prepare_raster(self, raster: bytes) -> tuple[bytes, int]:
+        """Pad a raster up to the model's minimum label length.
+
+        Returns ``(raster, raster_line_count)``.
+        """
+        bytes_per_line = self.profile.bytes_per_line
+        raster_lines = len(raster) // bytes_per_line
+        if raster_lines < self.profile.min_raster_lines:
+            raster = raster + b"\x00" * (
+                (self.profile.min_raster_lines - raster_lines) * bytes_per_line
+            )
+            raster_lines = self.profile.min_raster_lines
+        return raster, raster_lines
 
     def _send_page_classic(
         self,
@@ -327,6 +483,7 @@ class PTouchPrinter:
         auto_cut: bool,
         chain: bool,
         compress: bool,
+        half_cut: bool = False,
     ) -> None:
         """Sequence for the 2020+ generation (PT-D410/D460BT/D610BT/
         E310BT/E560BT), verified byte-for-byte against ptouch-print."""
@@ -345,7 +502,17 @@ class PTouchPrinter:
         )
         if auto_cut:
             self._send(protocol.set_page_mode(protocol.PageMode.auto_cut))
-        if chain:
+        # On this generation ESC i K is a one-byte advanced-mode packet sent
+        # *before* the raster (not the classic bitmask sent among the page
+        # setup). Its absence means "the trailing 0x1A feeds and fully cuts".
+        # 0x00 (== d460bt_chain) keeps the tape uncut so the next page joins
+        # on; the half-cut bit asks for a half cut at this page boundary
+        # instead of a full one. Only one of the two can be sent per page.
+        if half_cut:
+            self._send(
+                protocol.set_page_mode_advanced(protocol.PageModeAdvanced.half_cut)
+            )
+        elif chain:
             self._send(protocol.d460bt_chain())
         for line in protocol.encode_raster(
             raster,

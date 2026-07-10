@@ -17,6 +17,8 @@ class FakeTransport(Transport):
         self.status = status or make_status()
         self.ready = ready
         self.print_commands = 0
+        self.ff_commands = 0  # 0x0c "print page, more follow"
+        self.sub_commands = 0  # 0x1a "print and feed" (final page)
 
     def write(self, data: bytes) -> None:
         self.written.extend(data)
@@ -26,6 +28,10 @@ class FakeTransport(Transport):
             )
         elif data in (b"\x0c", b"\x1a"):
             self.print_commands += 1
+            if data == b"\x0c":
+                self.ff_commands += 1
+            else:
+                self.sub_commands += 1
             # phase change -> printing completed
             self.pending.extend(make_status(status_type=0x06, phase_type=1))
             self.pending.extend(make_status(status_type=0x01))
@@ -154,3 +160,114 @@ def test_print_text():
     printer = PTouchPrinter(transport)
     printer.print_text("Hello")
     assert transport.print_commands == 1
+
+
+# -- multi-label half-cut strips --------------------------------------------
+
+
+def test_print_images_d460bt_half_cut():
+    # E560BT (d460bt): three DIFFERENT labels as one half-cut strip.
+    transport = FakeTransport(status=make_status(tape_width=12))
+    printer = PTouchPrinter(transport)
+    printer.print_images(
+        [label_image(70), label_image(60), label_image(50)], dither=False
+    )
+    wire = bytes(transport.written)
+
+    # One job: the printer is reset before the first page but never again
+    # between/after pages.
+    first_page = wire.index(b"\x1biz")
+    assert b"\x1b@" not in wire[first_page:]
+    assert wire.count(b"\x1biz") == 3  # one print-info command per page
+    # Two inner pages carry the half-cut advanced packet; the last carries
+    # none so its 0x1A feeds and fully cuts.
+    assert wire.count(b"\x1biK\x04") == 2  # half-cut packet on inner pages
+    assert wire.count(b"\x1biK\x00") == 0  # never the plain chain packet
+    assert wire.count(b"\x1biM\x40") == 2  # cutter engaged on inner pages
+    # Every d460bt page finalizes with SUB; the fake counts them reliably.
+    assert transport.print_commands == 3
+    assert wire.endswith(b"\x1a")
+
+
+def test_print_images_d460bt_full_cut_when_half_cut_off():
+    transport = FakeTransport(status=make_status(tape_width=12))
+    printer = PTouchPrinter(transport)
+    printer.print_images(
+        [label_image(70), label_image(60)], half_cut=False, dither=False
+    )
+    wire = bytes(transport.written)
+    assert b"\x1biK\x04" not in wire  # no half-cut
+    assert b"\x1biK\x00" not in wire  # not chaining either
+    assert wire.count(b"\x1biM\x40") == 1  # inner page full-cuts via cutter
+    assert transport.print_commands == 2
+
+
+def test_print_images_classic_half_cut():
+    # E550W: classic generation with a half cutter.
+    transport = FakeTransport(status=make_status(model=0x66, tape_width=12))
+    printer = PTouchPrinter(transport)
+    printer.print_images(
+        [label_image(70), label_image(60), label_image(50)], dither=False
+    )
+    assert printer.profile.name == "PT-E550W"
+    wire = bytes(transport.written)
+
+    first_page = wire.index(b"\x1biz")
+    assert b"\x1b@" not in wire[first_page:]  # one job
+    assert wire.count(b"\x1biz") == 3  # per-page print-info
+    assert wire.count(b"\x1biK\x04") == 3  # half-cut + chaining on every page
+    assert transport.ff_commands == 2  # inner pages: FF (more pages follow)
+    assert transport.sub_commands == 1  # last page: SUB (eject + full cut)
+    assert wire.endswith(b"\x1a")  # last page ejects and full-cuts
+
+    # First page starts a new page (n9=0); follow-ups continue it (n9=1).
+    first = wire.index(b"\x1biz")
+    assert wire[first + 11] == 0x00
+    second = wire.index(b"\x1biz", first + 1)
+    assert wire[second + 11] == 0x01
+
+
+def test_print_images_classic_full_cut_fallback():
+    # P710BT: classic, auto cut but NO half cutter -> full cuts between labels.
+    transport = FakeTransport(status=make_status(model=0x76, tape_width=12))
+    printer = PTouchPrinter(transport)
+    printer.print_images([label_image(70), label_image(60)], dither=False)
+    assert printer.profile.name == "PT-P710BT"
+    assert not printer.profile.supports_half_cut
+    wire = bytes(transport.written)
+    assert b"\x1biK\x04" not in wire  # half-cut silently downgraded
+    assert b"\x1biK\x08" in wire  # no_page_chaining -> each page full-cuts
+    assert transport.print_commands == 2
+
+
+def test_print_images_no_cutter_prints_continuous_strip():
+    # P300BT: no cutter at all -> one continuous strip, warning logged.
+    transport = FakeTransport(status=make_status(model=0x72, tape_width=12))
+    printer = PTouchPrinter(transport)
+    printer.print_images([label_image(70), label_image(60)], dither=False)
+    assert not printer.profile.supports_auto_cut
+    wire = bytes(transport.written)
+    assert b"\x1biK\x04" not in wire
+    assert wire.count(b"\x1biM\x40") == 0  # cutter never engaged
+    assert transport.print_commands == 2
+
+
+def test_print_images_single_image_is_one_page():
+    transport = FakeTransport(status=make_status(tape_width=12))
+    printer = PTouchPrinter(transport)
+    printer.print_images([label_image(70)], dither=False)
+    wire = bytes(transport.written)
+    assert b"\x1biK" not in wire  # single page: no chain/half-cut packet
+    assert transport.print_commands == 1
+    assert wire.endswith(b"\x1a")
+
+
+def test_print_images_copies_repeat_strip():
+    transport = FakeTransport(status=make_status(tape_width=12))
+    printer = PTouchPrinter(transport)
+    printer.print_images([label_image(70), label_image(60)], copies=2, dither=False)
+    # 2 labels x 2 copies = 4 pages, 3 of them inner (half-cut), last ejects.
+    wire = bytes(transport.written)
+    assert wire.count(b"\x1biz") == 4
+    assert wire.count(b"\x1biK\x04") == 3
+    assert transport.print_commands == 4

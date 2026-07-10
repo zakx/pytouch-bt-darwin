@@ -36,6 +36,17 @@ def test_command_encodings():
     assert protocol.invalidate(3) == b"\x00\x00\x00"
 
 
+def test_page_mode_advanced_half_cut():
+    # ESC i K with the half-cut bit (1 << 2); no_page_chaining left clear so
+    # a half-cut strip keeps chaining. On the d460bt family this doubles as
+    # the leading advanced-mode packet.
+    cmd = protocol.set_page_mode_advanced(protocol.PageModeAdvanced.half_cut)
+    assert cmd == b"\x1biK\x04"
+    # d460bt "chain" packet is exactly the all-clear advanced mode.
+    assert protocol.d460bt_chain() == protocol.set_page_mode_advanced(0)
+    assert protocol.d460bt_chain() == b"\x1biK\x00"
+
+
 def test_set_print_parameters():
     cmd = protocol.set_print_parameters(
         media_type=protocol.MediaType.laminated,

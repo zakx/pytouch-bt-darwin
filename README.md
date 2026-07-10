@@ -44,6 +44,8 @@ ptouch-bt print -t "Hello world"      # print text
 ptouch-bt print -t "line1\nline2"     # multi-line
 ptouch-bt print -i label.png          # print an image
 ptouch-bt print -i label.png --copies 3 --chain
+ptouch-bt print -i a.png -i b.png -i c.png   # one strip, half-cut between labels
+ptouch-bt print -i a.png -i b.png --no-half-cut   # full cut between labels
 ptouch-bt print -t "test" --dry-run   # send everything except the print command
 ```
 
@@ -56,12 +58,23 @@ with PTouchPrinter.connect() as printer:   # autodetect; or connect("PT-E560BT_0
     print(printer.get_status().describe()) # what tape is loaded?
     printer.print_text("Hello world")
     printer.print_image("label.png")       # scaled to the tape height
+
+    # Several DIFFERENT labels as one strip, half-cut between each and a
+    # full cut at the end (what Brother's own apps do):
+    printer.print_images(["a.png", "b.png", "c.png"])
 ```
 
 Images are scaled so their height fills the printable area of the loaded
 tape (e.g. 70 dots on 12 mm tape at 180 dpi), dithered to 1-bit, and sent
-column by column. `print_raster()` accepts pre-encoded 1bpp data if you
-need full control.
+column by column.
+
+`print_images(images, half_cut=True)` sends the whole list as **one**
+print job: print parameters per page, the pages joined into a single tape
+strip, a half cut between each label, and a full cut (eject) at the very
+end. On models without a half cutter the labels are separated with full
+cuts instead; on models with no cutter at all they come out as one
+continuous strip (a warning is logged). `print_raster()` /
+`print_rasters()` accept pre-encoded 1bpp data if you need full control.
 
 ## macOS notes
 

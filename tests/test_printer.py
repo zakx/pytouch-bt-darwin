@@ -72,7 +72,7 @@ def test_print_image_d460bt_sequence():
     assert b"\x1bid\x0e\x00\x4d\x00" in wire  # D460BT margin magic
     assert b"M\x02" not in wire  # no compression on this generation
     assert b"Z" not in wire  # no zero-line shorthand either
-    assert b"\x1biK" not in wire  # no chain packet when not chaining
+    assert wire.count(b"\x1biK\x08") == 1  # explicit full cut after the page
     assert wire.endswith(b"\x1a")  # always finalize with print & feed
     assert transport.print_commands == 1
 
@@ -113,7 +113,8 @@ def test_print_two_copies_d460bt():
     wire = bytes(transport.written)
     assert transport.print_commands == 2
     assert wire.count(b"\x1a") == 2  # each copy finalized with eject
-    assert wire.count(b"\x1biK\x00") == 1  # chain packet on first copy only
+    assert wire.count(b"\x1biK\x00") == 1  # chain packet on first copy
+    assert wire.count(b"\x1biK\x08") == 1  # explicit full cut on last copy
     assert wire.endswith(b"\x1a")
 
 
@@ -179,11 +180,12 @@ def test_print_images_d460bt_half_cut():
     first_page = wire.index(b"\x1biz")
     assert b"\x1b@" not in wire[first_page:]
     assert wire.count(b"\x1biz") == 3  # one print-info command per page
-    # Two inner pages carry the half-cut advanced packet; the last carries
-    # none so its 0x1A feeds and fully cuts.
-    assert wire.count(b"\x1biK\x04") == 2  # half-cut packet on inner pages
-    assert wire.count(b"\x1biK\x00") == 0  # never the plain chain packet
-    assert wire.count(b"\x1biM\x40") == 2  # cutter engaged on inner pages
+    # Per-page ESC i K packets (hardware-verified on a PT-E560BT): the two
+    # inner pages half-cut (0x04), the last page full-cuts (0x08).
+    assert wire.count(b"\x1biK\x04") == 2  # half cut after each inner page
+    assert wire.count(b"\x1biK\x08") == 1  # full cut after the last page
+    assert b"\x1biK\x00" not in wire  # never the chain packet
+    assert b"\x1biM\x40" not in wire  # ESC i M 40 would force full cuts
     # Every d460bt page finalizes with SUB; the fake counts them reliably.
     assert transport.print_commands == 3
     assert wire.endswith(b"\x1a")
@@ -197,8 +199,9 @@ def test_print_images_d460bt_full_cut_when_half_cut_off():
     )
     wire = bytes(transport.written)
     assert b"\x1biK\x04" not in wire  # no half-cut
-    assert b"\x1biK\x00" not in wire  # not chaining either
-    assert wire.count(b"\x1biM\x40") == 1  # inner page full-cuts via cutter
+    assert wire.count(b"\x1biK\x08") == 2  # explicit full cut after every page
+    assert b"\x1biK\x00" not in wire  # no chaining
+    assert b"\x1biM\x40" not in wire  # ESC i M 40 is never sent on this family
     assert transport.print_commands == 2
 
 
@@ -257,7 +260,8 @@ def test_print_images_single_image_is_one_page():
     printer = PTouchPrinter(transport)
     printer.print_images([label_image(70)], dither=False)
     wire = bytes(transport.written)
-    assert b"\x1biK" not in wire  # single page: no chain/half-cut packet
+    assert wire.count(b"\x1biK\x08") == 1  # single page: full cut at the end
+    assert b"\x1biK\x04" not in wire  # no half cut needed
     assert transport.print_commands == 1
     assert wire.endswith(b"\x1a")
 
@@ -266,8 +270,9 @@ def test_print_images_copies_repeat_strip():
     transport = FakeTransport(status=make_status(tape_width=12))
     printer = PTouchPrinter(transport)
     printer.print_images([label_image(70), label_image(60)], copies=2, dither=False)
-    # 2 labels x 2 copies = 4 pages, 3 of them inner (half-cut), last ejects.
+    # 2 labels x 2 copies = 4 pages, 3 of them inner (half-cut), last full-cuts.
     wire = bytes(transport.written)
     assert wire.count(b"\x1biz") == 4
-    assert wire.count(b"\x1biK\x04") == 3
+    assert wire.count(b"\x1biK\x04") == 3  # half cut after the 3 inner pages
+    assert wire.count(b"\x1biK\x08") == 1  # full cut after the last page
     assert transport.print_commands == 4

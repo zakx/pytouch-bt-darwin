@@ -282,8 +282,9 @@ class PTouchPrinter:
                 self._send_page_d460bt(
                     raster, raster_lines, status,
                     end_margin_dots=end_margin_dots,
-                    auto_cut=auto_cut,
-                    chain=chain or not last_page,
+                    # Inner copies chain into one uncut strip; the last page
+                    # cuts, unless the caller asked to chain (leave tape uncut).
+                    end_of_page="chain" if (chain or not last_page) else "full",
                     compress=compress,
                 )
             else:
@@ -367,17 +368,17 @@ class PTouchPrinter:
         for index, (raster, raster_lines) in enumerate(pages):
             last_page = index == len(pages) - 1
             if profile.d460bt_mode:
-                # This generation ends every page with 0x1A and uses the
-                # leading ESC i K packet to decide the cut: half-cut bit on the
-                # inner pages, nothing on the final page (so its 0x1A feeds and
-                # fully cuts). Engage the cutter on the inner pages so the
-                # requested cut actually happens.
+                # This generation ends every page with 0x1A and selects the cut
+                # with a per-page ESC i K packet sent before the raster data:
+                # half cut after each inner page (the strip stays in one piece
+                # until torn apart) and a full cut after the last. With
+                # half_cut off, every page — including the last — full-cuts
+                # into its own label. See _send_page_d460bt for the verified
+                # byte semantics.
                 self._send_page_d460bt(
                     raster, raster_lines, status,
                     end_margin_dots=end_margin_dots,
-                    auto_cut=can_cut and not last_page,
-                    chain=False,
-                    half_cut=half_cut and not last_page,
+                    end_of_page="half" if (half_cut and not last_page) else "full",
                     compress=compress,
                 )
             else:
@@ -480,13 +481,17 @@ class PTouchPrinter:
         status: PrinterStatus,
         *,
         end_margin_dots: int,
-        auto_cut: bool,
-        chain: bool,
+        end_of_page: str,  # "half" | "full" | "chain"
         compress: bool,
-        half_cut: bool = False,
     ) -> None:
         """Sequence for the 2020+ generation (PT-D410/D460BT/D610BT/
-        E310BT/E560BT), verified byte-for-byte against ptouch-print."""
+        E310BT/E560BT), verified byte-for-byte against ptouch-print.
+
+        *end_of_page* selects what happens after this page's trailing 0x1A
+        print command: ``"half"`` = half cut (label layer cut, backing
+        intact), ``"full"`` = full cut, ``"chain"`` = no feed and no cut
+        (the next page joins on, or the tape stays in the machine).
+        """
         if compress:
             self._send(protocol.set_compression(protocol.CompressionType.rle))
         self._send(
@@ -500,20 +505,31 @@ class PTouchPrinter:
             ),
             protocol.d460bt_margin_magic(end_margin_dots),
         )
-        if auto_cut:
-            self._send(protocol.set_page_mode(protocol.PageMode.auto_cut))
-        # On this generation ESC i K is a one-byte advanced-mode packet sent
-        # *before* the raster (not the classic bitmask sent among the page
-        # setup). Its absence means "the trailing 0x1A feeds and fully cuts".
-        # 0x00 (== d460bt_chain) keeps the tape uncut so the next page joins
-        # on; the half-cut bit asks for a half cut at this page boundary
-        # instead of a full one. Only one of the two can be sent per page.
-        if half_cut:
+        # On this generation ESC i K is a one-byte per-page packet sent
+        # *before* the raster data (not the classic bitmask sent among the
+        # page setup). Hardware-verified on a PT-E560BT (2026-07-11 probe):
+        #   ESC i K 04 -> HALF cut after this page
+        #   ESC i K 08 -> FULL cut after this page
+        #   ESC i K 00 -> chain: no feed, no cut (next page joins on)
+        # The packets are strictly per-page, not a sticky job mode — but a
+        # page carrying no packet at all does NOT reliably cut once an
+        # earlier page in the job chained, so every page sends one
+        # explicitly. ESC i M 40 forces a full cut per page even alongside
+        # ESC i K 04, so no ESC i M packet is ever sent on this family.
+        if end_of_page == "half":
             self._send(
                 protocol.set_page_mode_advanced(protocol.PageModeAdvanced.half_cut)
             )
-        elif chain:
+        elif end_of_page == "full":
+            self._send(
+                protocol.set_page_mode_advanced(
+                    protocol.PageModeAdvanced.no_page_chaining
+                )
+            )
+        elif end_of_page == "chain":
             self._send(protocol.d460bt_chain())
+        else:
+            raise ValueError(f"unknown end_of_page: {end_of_page!r}")
         for line in protocol.encode_raster(
             raster,
             self.profile.bytes_per_line,

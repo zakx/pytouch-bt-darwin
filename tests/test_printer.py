@@ -163,6 +163,55 @@ def test_print_text():
     assert transport.print_commands == 1
 
 
+# -- connect() probing -------------------------------------------------------
+
+
+class SilentTransport(FakeTransport):
+    """Opens fine but never answers — a channel onto a stale session."""
+
+    def write(self, data: bytes) -> None:
+        pass
+
+    def read(self, size: int, timeout: float | None = None) -> bytes:
+        raise TimeoutError("no reply")
+
+
+def test_connect_retries_silent_bluetooth_probe_on_fresh_link(monkeypatch):
+    """A channel that opens but stays silent gets one retry over a fresh
+    baseband link (macOS auto-restores stale iAP links after a disconnect,
+    and a channel opened over one goes nowhere)."""
+    calls = []
+
+    def fake_candidates(target, timeout):
+        def factory(fresh):
+            calls.append(fresh)
+            return FakeTransport() if fresh else SilentTransport()
+
+        yield ("bluetooth device fake", factory, True)
+
+    monkeypatch.setattr(
+        PTouchPrinter, "_candidate_transports", staticmethod(fake_candidates)
+    )
+    printer = PTouchPrinter.connect("fake")
+    assert calls == [False, True]  # silent first attempt, fresh retry wins
+    assert printer.get_status().model_name == "PT-E560BT"
+
+
+def test_connect_gives_up_after_fresh_retry(monkeypatch):
+    def fake_candidates(target, timeout):
+        yield ("bluetooth device fake", lambda fresh: SilentTransport(), True)
+
+    monkeypatch.setattr(
+        PTouchPrinter, "_candidate_transports", staticmethod(fake_candidates)
+    )
+    try:
+        PTouchPrinter.connect("fake")
+    except Exception as exc:
+        assert "no response" in str(exc)
+    else:
+        raise AssertionError("expected PTouchError")
+
+
 # -- multi-label half-cut strips --------------------------------------------
 
 

@@ -60,23 +60,41 @@ class PTouchPrinter:
         swallows data silently.)
         """
         errors: list[str] = []
-        for describe, factory in cls._candidate_transports(target, timeout):
-            try:
-                transport = factory()
-            except Exception as exc:
-                log.debug("%s unavailable: %s", describe, exc)
-                errors.append(f"{describe}: {exc}")
-                continue
-            printer = cls(transport)
-            try:
-                printer.get_status()
-            except (TimeoutError, OSError, ValueError) as exc:
-                log.info("%s did not respond (%s); trying next", describe, exc)
-                errors.append(f"{describe}: no response")
-                transport.close()
-                continue
-            log.info("connected via %r", transport)
-            return printer
+        for describe, factory, retry_fresh in cls._candidate_transports(
+            target, timeout
+        ):
+            attempts = (False, True) if retry_fresh else (False,)
+            for fresh in attempts:
+                try:
+                    transport = factory(fresh)
+                except Exception as exc:
+                    log.debug("%s unavailable: %s", describe, exc)
+                    errors.append(f"{describe}: {exc}")
+                    break
+                printer = cls(transport)
+                try:
+                    printer.get_status()
+                except (TimeoutError, OSError, ValueError) as exc:
+                    transport.close()
+                    if not fresh and retry_fresh:
+                        # The channel opened but the printer stayed silent —
+                        # the classic symptom of a stale session: macOS
+                        # auto-restores the iAP baseband link after a
+                        # disconnect, and a channel opened over that
+                        # half-open link goes nowhere. Retry once over a
+                        # deliberately fresh link before giving up.
+                        log.info(
+                            "%s did not respond (%s); retrying on a fresh "
+                            "baseband link",
+                            describe,
+                            exc,
+                        )
+                        continue
+                    log.info("%s did not respond (%s); trying next", describe, exc)
+                    errors.append(f"{describe}: no response")
+                    break
+                log.info("connected via %r", transport)
+                return printer
         detail = "; ".join(errors) if errors else "no candidate transports found"
         raise PTouchError(
             f"could not reach a printer ({detail}). Is it on and paired? "
@@ -85,18 +103,27 @@ class PTouchPrinter:
 
     @staticmethod
     def _candidate_transports(target: str | None, timeout: float):
+        """Yield ``(description, factory, retry_fresh)`` candidates.
+
+        Each factory takes one bool: open the connection from a
+        deliberately fresh baseband link (Bluetooth only; serial ports
+        ignore it). *retry_fresh* marks candidates where a silent probe is
+        worth one fresh-link retry.
+        """
         from .transport.iobluetooth import HAVE_IOBLUETOOTH, IOBluetoothTransport
 
         if target is not None:
             if target.startswith("/dev/") or target.upper().startswith("COM"):
                 yield (
                     f"serial port {target}",
-                    lambda: SerialTransport(target, timeout=timeout),
+                    lambda fresh: SerialTransport(target, timeout=timeout),
+                    False,
                 )
             else:
                 yield (
                     f"bluetooth device {target}",
-                    lambda: IOBluetoothTransport(target),
+                    lambda fresh: IOBluetoothTransport(target, fresh=fresh),
+                    True,
                 )
             return
         # Autodetect: direct RFCOMM (SDP-resolved SPP channel) first, then
@@ -105,12 +132,14 @@ class PTouchPrinter:
             for name in IOBluetoothTransport.find_devices():
                 yield (
                     f"bluetooth device {name}",
-                    lambda name=name: IOBluetoothTransport(name),
+                    lambda fresh, name=name: IOBluetoothTransport(name, fresh=fresh),
+                    True,
                 )
         for port in find_serial_ports():
             yield (
                 f"serial port {port}",
-                lambda port=port: SerialTransport(port, timeout=timeout),
+                lambda fresh, port=port: SerialTransport(port, timeout=timeout),
+                False,
             )
 
     # -- session helpers ----------------------------------------------------

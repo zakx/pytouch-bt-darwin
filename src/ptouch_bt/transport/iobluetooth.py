@@ -118,7 +118,12 @@ class IOBluetoothTransport(Transport):
         device=None,
         delegate_factory=None,
         pump=None,
+        fresh: bool = False,
     ) -> None:
+        """*fresh* forces the connect to start from a clean baseband link
+        (drop + re-page) instead of reusing one macOS reports as up — the
+        recovery move when a reused link opens a channel that goes nowhere.
+        """
         if device is None:
             if not HAVE_IOBLUETOOTH:
                 raise ImportError(
@@ -135,7 +140,7 @@ class IOBluetoothTransport(Transport):
         self._delegate = None
         self._channel = None
 
-        channel, resolved_channel_id = self._open_session(channel_id)
+        channel, resolved_channel_id = self._open_session(channel_id, fresh=fresh)
 
         self._channel = channel
         self.channel_id = resolved_channel_id
@@ -148,12 +153,14 @@ class IOBluetoothTransport(Transport):
 
     # -- staged connect -----------------------------------------------------
 
-    def _open_session(self, channel_id: int | None):
+    def _open_session(self, channel_id: int | None, fresh: bool = False):
         """Bring up an RFCOMM channel, resetting the baseband and retrying
         once if the first attempt fails.  Returns ``(channel, channel_id)``."""
         # Pass 1: use whatever baseband link already exists (page the device
-        # only if it is genuinely disconnected).
-        self._ensure_baseband(reset=False)
+        # only if it is genuinely disconnected). With *fresh* the caller has
+        # already decided the existing link can't be trusted, so start from
+        # a reset right away.
+        self._ensure_baseband(reset=fresh)
         ch_id = channel_id if channel_id is not None else self._resolve_channel()
         channel = self._try_open_channel(ch_id)
         if channel is not None:

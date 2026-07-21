@@ -375,10 +375,22 @@ class PTouchPrinter:
                 # half_cut off, every page — including the last — full-cuts
                 # into its own label. See _send_page_d460bt for the verified
                 # byte semantics.
+                if half_cut and not last_page:
+                    end_of_page = "half"
+                elif half_cut and len(pages) == 1:
+                    # A one-page half-cut job still wants the leading margin
+                    # trimmed: with a 04 packet somewhere in the job the
+                    # printer half-cuts the front margin off, but a lone 08
+                    # page never engages the half cutter at all. Combine both
+                    # bits (ESC i K 0C = half cut + no chaining) so the single
+                    # label gets the leading trim AND the full-cut eject.
+                    end_of_page = "half+full"
+                else:
+                    end_of_page = "full"
                 self._send_page_d460bt(
                     raster, raster_lines, status,
                     end_margin_dots=end_margin_dots,
-                    end_of_page="half" if (half_cut and not last_page) else "full",
+                    end_of_page=end_of_page,
                     compress=compress,
                 )
             else:
@@ -489,8 +501,10 @@ class PTouchPrinter:
 
         *end_of_page* selects what happens after this page's trailing 0x1A
         print command: ``"half"`` = half cut (label layer cut, backing
-        intact), ``"full"`` = full cut, ``"chain"`` = no feed and no cut
-        (the next page joins on, or the tape stays in the machine).
+        intact), ``"full"`` = full cut, ``"half+full"`` = half-cut mode with
+        a full-cut eject (a one-page job that wants its leading margin
+        trimmed), ``"chain"`` = no feed and no cut (the next page joins on,
+        or the tape stays in the machine).
         """
         if compress:
             self._send(protocol.set_compression(protocol.CompressionType.rle))
@@ -524,6 +538,13 @@ class PTouchPrinter:
             self._send(
                 protocol.set_page_mode_advanced(
                     protocol.PageModeAdvanced.no_page_chaining
+                )
+            )
+        elif end_of_page == "half+full":
+            self._send(
+                protocol.set_page_mode_advanced(
+                    protocol.PageModeAdvanced.half_cut
+                    | protocol.PageModeAdvanced.no_page_chaining
                 )
             )
         elif end_of_page == "chain":

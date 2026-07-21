@@ -260,10 +260,24 @@ def test_print_images_single_image_is_one_page():
     printer = PTouchPrinter(transport)
     printer.print_images([label_image(70)], dither=False)
     wire = bytes(transport.written)
-    assert wire.count(b"\x1biK\x08") == 1  # single page: full cut at the end
-    assert b"\x1biK\x04" not in wire  # no half cut needed
+    # A lone half-cut page sends the combined bitmask 0C: half-cut mode so
+    # the leading margin is trimmed off, no-chaining so it ejects with a
+    # full cut. A plain 08 never engages the half cutter at all.
+    assert wire.count(b"\x1biK\x0c") == 1
+    assert b"\x1biK\x04" not in wire  # no between-label cuts on one page
+    assert b"\x1biK\x08" not in wire
     assert transport.print_commands == 1
     assert wire.endswith(b"\x1a")
+
+
+def test_print_images_single_image_full_cut_only_when_half_cut_off():
+    transport = FakeTransport(status=make_status(tape_width=12))
+    printer = PTouchPrinter(transport)
+    printer.print_images([label_image(70)], half_cut=False, dither=False)
+    wire = bytes(transport.written)
+    assert wire.count(b"\x1biK\x08") == 1  # plain full cut, no leading trim
+    assert b"\x1biK\x0c" not in wire
+    assert b"\x1biK\x04" not in wire
 
 
 def test_print_images_copies_repeat_strip():
